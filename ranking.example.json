@@ -1,0 +1,10 @@
+{
+  "topic_weights": {"general": 1.0},
+  "prefix_rules": [
+    {"prefix": "example-", "weight": 1.0, "unless": "\\bexample\\b"}
+  ],
+  "hidden_topics": ["examples"],
+  "page_weights": {"toc": 0.35, "index": 0.35},
+  "superseded_weight": 0.85,
+  "synonyms": {}
+}

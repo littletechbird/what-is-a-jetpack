@@ -6,25 +6,38 @@
   python tools/ask.py --list
 
 Prints matching passages with document and page citations.
-Keyword rank is SQLite FTS5 / BM25. When index/vectors.npy is present, that
-rank is blended with local embeddings (reciprocal rank fusion). Search does
-not call a paid search API.
+Keyword rank is SQLite FTS5 / BM25. When index/vectors.npz is present, that
+rank is blended with local embeddings (reciprocal rank fusion). A vector is
+used only while its chunk still has the text it was embedded from. When
+keyword search finds nothing, the answer is a miss, with or without vectors.
+Search does not call a paid search API.
+
+Topic weights and document-prefix rules are local settings. They go in
+ranking.local.json in the jetpack home; ranking.example.json shows the shape.
 """
 import argparse
+import bisect
 import json
+import math
 import os
 import re
-import sqlite3
 import sys
+import unicodedata
+from contextlib import closing
 
-from home import jetpack_home, safe_doc_id
+from extract import printable
+from home import jetpack_home, safe_doc_id, within
+from ingest import EMBED_MODEL, IndexUnavailable, open_index, text_root, vector_path
+from redact import normalize
 
 STOP = set("""a an and are as at be by can do does for from how i in is it me my of on or should the to what when where which who why will with
-you your we our this that there their they them than then into about over under per vs versus much many get need use job rms test testing tested value values minimum maximum""".split())
+you your we our this that there their they them than then into about over under per vs versus much many get need use""".split())
+# Common in questions and weak on their own. Dropped only when other words are left.
+SOFT = set("job rms test testing tested value values minimum maximum".split())
+MAX_GROUPS = 12
 
 SYN = {
     "ir": ["insulation", "resistance", "megohm"],
-    "megger": ["megger", "insulation", "resistance", "insulation resistance", "megohm", "megohms"],
     "dga": ["dga", "dissolved", "gas", "dissolved gas", "dissolved gases", "dissolved gas analysis", "gas-in-oil"],
     "vlf": ["vlf", "very", "low", "frequency"],
     "pf": ["power", "factor"],
@@ -49,8 +62,7 @@ SYN = {
     "assured": ["assured", "aegcp"],
     "lock": ["lock", "lockout", "loto"],
     "tag": ["tag", "tagout", "loto"],
-    "dlro": ["dlro", "contact resistance", "ductor", "micro-ohm", "microhm", "micro ohm"],
-    "ductor": ["ductor", "dlro", "contact resistance"],
+    "dlro": ["dlro", "contact resistance", "micro-ohm", "microhm", "micro ohm"],
     "withstand": ["withstand", "hipot", "high-potential"],
     "dissolved": ["dissolved", "dga"],
     "tdcg": ["tdcg", "total dissolved combustible gas", "combustible gas"],
@@ -81,27 +93,11 @@ SYN = {
     "cable": ["cable", "cables"],
     "breaker": ["breaker", "breakers"],
 }
-
-# Topic weights are generic. Document ids are not hardcoded.
-DOC_PRIOR = {
-    "oil-lab": 0.8, "hse": 1.15, "hr": 1.15, "ops": 1.0, "rates": 1.05, "training": 0.9,
-    "standards": 1.15, "breakers": 1.1, "oil": 1.1, "doble": 1.0, "cable": 1.1, "relays": 1.05,
-    "safety": 1.05, "pd": 1.0, "examples": 0.8, "brochures": 0.7, "study": 0.7,
-}
-PAGE_DEMOTE = {"toc": 0.35, "index": 0.35}
-DOC_DEMOTE = {}
-DOC_NAMED = {}
-REF_W = 0.8
-REF_FAMILY = [
-    ("nec-", r"\bnec\b|national electrical code|\barticle \d{3}\b"),
-    ("ieee-", r"\bieee\b|\bc57|\b450\b|\b1188\b|\b81\b"),
-]
 INTENT = {"minimum", "maximum", "limit", "limits", "value", "values", "voltage", "acceptable", "acceptance", "table", "level", "levels"}
 PHRASES = [
     (r"\bhi[- ]?pot\b", "hipot"),
     (r"\bhigh[- ]potential\b", "hipot"),
     (r"\block[- ]?out[ /-]*tag[- ]?out\b", "loto"),
-    (r"\bductor\b", "dlro"),
     (r"\bassured (equipment )?grounding( conductor)?( program)?\b", "aegcp assured grounding"),
 ]
 EDN = "Older edition: a newer edition may exist. Check the current edition before relying on this for compliance."
@@ -110,7 +106,6 @@ VEC_EXPAND = {
     "gfci": "ground fault circuit interrupter",
     "aegcp": "assured equipment grounding conductor program cord sets",
     "loto": "lockout tagout",
-    "megger": "insulation resistance test",
     "dlro": "contact resistance micro-ohm test",
     "hipot": "dielectric withstand high-potential test",
     "dga": "dissolved gas analysis",
@@ -119,66 +114,149 @@ VEC_EXPAND = {
     "scan": "infrared thermographic survey",
 }
 RRF_BM, RRF_VEC, VEC_W = 30, 60, 0.8
+RANKING_NAME = "ranking.local.json"
+# Neutral on purpose. Library-specific weights belong in ranking.local.json.
+DEFAULT_RANKING = {
+    "topic_weights": {},
+    "prefix_rules": [],
+    "hidden_topics": ["examples"],
+    "page_weights": {"toc": 0.35, "index": 0.35},
+    "superseded_weight": 0.85,
+    "synonyms": {},
+}
+TOKEN_RE = re.compile(r"[^\W_]+(?:\.[0-9]+)*")
 _PF = None
 _MODEL = None
+NOTES = []
 
 
-def db_path():
-    return os.path.join(jetpack_home(), "index", "jetpack.db")
+def _note(message):
+    if message not in NOTES:
+        NOTES.append(message)
+
+
+def _weight(value):
+    return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value) and value >= 0
+
+
+def load_ranking():
+    """Neutral defaults, overridden by ranking.local.json in the jetpack home. A bad file or entry is noted and ignored."""
+    ranking = {
+        "topic_weights": {},
+        "prefix_rules": [],
+        "hidden_topics": set(DEFAULT_RANKING["hidden_topics"]),
+        "page_weights": dict(DEFAULT_RANKING["page_weights"]),
+        "superseded_weight": DEFAULT_RANKING["superseded_weight"],
+        "synonyms": {},
+    }
+    path = os.path.join(jetpack_home(), RANKING_NAME)
+    if not os.path.isfile(path):
+        return ranking
+    try:
+        with open(path, encoding="utf-8") as handle:
+            data = json.load(handle)
+        if not isinstance(data, dict):
+            raise ValueError("expected a JSON object")
+    except (OSError, ValueError) as exc:
+        _note(f"ignored {RANKING_NAME}: {exc}")
+        return ranking
+    for key in ("topic_weights", "page_weights"):
+        table = data.get(key, {})
+        if isinstance(table, dict):
+            ranking[key].update({str(name): float(value) for name, value in table.items() if _weight(value)})
+    if _weight(data.get("superseded_weight")):
+        ranking["superseded_weight"] = float(data["superseded_weight"])
+    hidden = data.get("hidden_topics")
+    if isinstance(hidden, list):
+        ranking["hidden_topics"] = {str(name) for name in hidden}
+    synonyms = data.get("synonyms", {})
+    if isinstance(synonyms, dict):
+        for word, alternatives in synonyms.items():
+            if isinstance(alternatives, list):
+                ranking["synonyms"][norm(str(word))] = [norm(str(item)) for item in alternatives]
+    rules = data.get("prefix_rules", [])
+    for number, item in enumerate(rules if isinstance(rules, list) else [], 1):
+        if not isinstance(item, dict) or not isinstance(item.get("prefix"), str) or not _weight(item.get("weight")):
+            _note(f"ignored prefix rule {number} in {RANKING_NAME}: it needs a prefix and a weight")
+            continue
+        try:
+            unless = re.compile(item["unless"], re.I) if item.get("unless") else None
+        except (re.error, TypeError) as exc:
+            _note(f"ignored prefix rule {number} in {RANKING_NAME}: {exc}")
+            continue
+        ranking["prefix_rules"].append((item["prefix"], float(item["weight"]), unless))
+    return ranking
 
 
 def connect():
-    path = db_path()
-    if not os.path.exists(path):
-        raise FileNotFoundError(f"No jetpack index at {path}. Run tools/ingest.py first.")
-    return sqlite3.connect(path)
+    return open_index()
 
 
-def demote(doc, page, flags, q=""):
+def _page_flags(db):
+    return {(d, p): f for d, p, f in db.execute("select doc_id, page, flag from page_flags")}
+
+
+def demote(doc, page, flags, q="", ranking=None):
     global _PF
+    ranking = ranking or load_ranking()
     flags = flags or ""
     if _PF is None:
         try:
-            with connect() as db:
-                _PF = {(d, p): f for d, p, f in db.execute("select doc_id, page, flag from page_flags")}
+            with closing(connect()) as db:
+                _PF = _page_flags(db)
         except Exception:
             _PF = {}
-    named = doc in DOC_NAMED and re.search(DOC_NAMED[doc], q.lower())
-    factor = PAGE_DEMOTE.get(_PF.get((doc, page)), 1.0) * (1.0 if named else DOC_DEMOTE.get(doc, 1.0))
-    if "superseded" in flags and "rates" not in flags and doc not in DOC_DEMOTE:
-        factor *= 0.85
-    for prefix, pattern in REF_FAMILY:
-        if doc.startswith(prefix) and not re.search(pattern, q.lower()):
-            factor *= REF_W
+    factor = ranking["page_weights"].get(_PF.get((doc, page)), 1.0)
+    if "superseded" in flags:
+        factor *= ranking["superseded_weight"]
+    low = q.lower()
+    for prefix, weight, unless in ranking["prefix_rules"]:
+        if doc.startswith(prefix) and not (unless and unless.search(low)):
+            factor *= weight
     return factor
 
 
 def norm(q):
-    q = q.lower()
+    q = normalize(q).lower()
     for pattern, repl in PHRASES:
         q = re.sub(pattern, repl, q)
     return q
 
 
-def groups(q):
+def fold(text):
+    """Case and accents folded the way the FTS tokenizer folds them, for word checks in Python."""
+    text = unicodedata.normalize("NFKD", normalize(text).casefold())
+    return "".join(ch for ch in text if not unicodedata.combining(ch))
+
+
+def stem(word):
+    return word[:-1] if len(word) > 3 and word.endswith("s") and not word.endswith("ss") else word
+
+
+def groups(q, ranking=None):
     """One OR-group per meaningful query word (word + synonyms + split units like 15kv -> 15)."""
-    found = []
-    q = norm(q)
-    for token in re.findall(r"[a-z0-9]+(?:\.[0-9]+)*", q):
-        if token in STOP or (len(token) < 2 and not token.isdigit()):
+    syn = dict(SYN)
+    if ranking:
+        syn.update(ranking["synonyms"])
+    found, soft, seen = [], [], set()
+    for token in TOKEN_RE.findall(norm(q)):
+        if token in seen or token in STOP:
             continue
-        group = [token] + SYN.get(token, [])
+        if len(token) < 2 and token.isascii() and not token.isdigit():
+            continue
+        seen.add(token)
+        group = [token] + syn.get(token, [])
         unit = re.match(r"^(\d+)(kv|v|a|kva|hz)$", token)
         if unit:
             group.append(unit.group(1))
         if token.endswith("s") and len(token) > 3:
             group.append(token[:-1])
-        found.append(list(dict.fromkeys(group)))
-    return found
+        (soft if token in SOFT else found).append(list(dict.fromkeys(group)))
+    return (found or soft)[:MAX_GROUPS]
 
 
-def terms(q):
-    return list(dict.fromkeys(token for group in groups(q) for token in group))
+def terms(q, ranking=None):
+    return list(dict.fromkeys(token for group in groups(q, ranking) for token in group))
 
 
 def _phrase(token):
@@ -193,7 +271,28 @@ def fts_and(gs):
     return " AND ".join("(" + " OR ".join(_phrase(token) for token in group) + ")" for group in gs)
 
 
-def _run(db, match, topic, examples):
+def group_matcher(group):
+    """True when a page holds one of the group's words as a whole word, or one of its phrases."""
+    singles, phrases = set(), []
+    for token in group:
+        words = TOKEN_RE.findall(fold(token))
+        if len(words) == 1:
+            singles.add(stem(words[0]))
+        elif words:
+            phrases.append(re.compile(r"(?<!\w)" + r"\W+".join(map(re.escape, words)) + r"(?!\w)"))
+
+    def matches(folded, stems):
+        return bool(singles & stems) or any(pattern.search(folded) for pattern in phrases)
+
+    return matches
+
+
+def page_words(text):
+    folded = fold(text)
+    return folded, {stem(word) for word in TOKEN_RE.findall(folded)}
+
+
+def _run(db, match, topic, hidden):
     sql = """select c.id, c.doc_id, c.page, c.text, d.title, d.topic, d.flags, d.page_label, bm25(chunks_fts, 1.0, 0.6) as score
              from chunks_fts join chunks c on c.id = chunks_fts.rowid join docs d on d.doc_id = c.doc_id
              where chunks_fts match ? """
@@ -201,28 +300,34 @@ def _run(db, match, topic, examples):
     if topic:
         sql += " and d.topic = ?"
         args.append(topic)
-    if not examples:
-        sql += " and d.topic not in ('examples','brochures')"
+    if hidden:
+        sql += " and d.topic not in (%s)" % ",".join("?" * len(hidden))
+        args.extend(hidden)
     sql += " order by score limit 300"
     return db.execute(sql, args).fetchall()
 
 
 def search(q, k=5, topic=None, examples=True):
     global _PF
-    _PF = None
-    gs = groups(q)
+    if k <= 0:
+        return []
+    ranking = load_ranking()
+    gs = groups(q, ranking)
     if not gs:
         return []
-    intent = bool(INTENT & set(re.findall(r"[a-z]+", q.lower())))
+    intent = bool(INTENT & set(TOKEN_RE.findall(norm(q))))
+    matchers = [group_matcher(group) for group in gs]
+    hidden = [] if examples else sorted(ranking["hidden_topics"])
     rows, seen_ids = [], set()
     tries = [fts_and(gs)]
     if len(gs) > 2:
         tries += [fts_and(gs[:i] + gs[i + 1:]) for i in range(len(gs))]
     tries.append(fts_or(gs))
-    with connect() as db:
+    with closing(connect()) as db:
+        _PF = _page_flags(db)
         for level, match in enumerate(tries):
             level_weight = 1.0 if level == 0 else (0.8 if level < len(tries) - 1 else 0.55)
-            for row in _run(db, match, topic, examples):
+            for row in _run(db, match, topic, hidden):
                 if row[0] in seen_ids:
                     continue
                 seen_ids.add(row[0])
@@ -232,20 +337,20 @@ def search(q, k=5, topic=None, examples=True):
         ranked, page_cache = [], {}
         for (cid, doc, page, text, title, top, flags, label, score), level_weight in rows:
             if (doc, page) not in page_cache:
-                page_cache[(doc, page)] = " ".join(
+                page_cache[(doc, page)] = page_words(" ".join(
                     body for (body,) in db.execute("select text from chunks where doc_id=? and page=?", (doc, page))
-                ).lower()
-            low = page_cache[(doc, page)]
-            cover = sum(1 for group in gs if any(token in low for token in group)) / len(gs)
+                ))
+            folded, stems = page_cache[(doc, page)]
+            cover = sum(1 for matches in matchers if matches(folded, stems)) / len(gs)
             if cover == 1.0 and level_weight < 1.0:
                 level_weight = 1.0
-            weight = (-score) * (0.4 + cover) * level_weight * DOC_PRIOR.get(top, 1.0)
-            if intent and re.search(r"\btable\b", low):
+            weight = (-score) * (0.4 + cover) * level_weight * ranking["topic_weights"].get(top, 1.0)
+            if intent and re.search(r"\btable\b", folded):
                 weight *= 1.25
-            weight *= demote(doc, page, flags, q)
+            weight *= demote(doc, page, flags, q, ranking)
             ranked.append((weight, cid, doc, page, text, title, flags, label))
     ranked.sort(reverse=True)
-    query_terms = terms(q)
+    query_terms = terms(q, ranking)
     out, seen = [], set()
     for weight, cid, doc, page, text, title, flags, label in ranked:
         if (doc, page) in seen:
@@ -272,32 +377,81 @@ def vec_query(q):
     return q + (" (" + "; ".join(extra) + ")" if extra else "")
 
 
-def vector_hits(q, n=40, topic=None, examples=True):
-    """Meaning-based hits from local embeddings. Empty when vectors or libraries are missing."""
-    home = jetpack_home()
-    vec_path = os.path.join(home, "index", "vectors.npy")
-    if not os.path.exists(vec_path):
+def _load_model():
+    global _MODEL
+    if _MODEL is None:
+        from fastembed import TextEmbedding
+
+        cache = os.environ.setdefault("FASTEMBED_CACHE_PATH", os.path.join(jetpack_home(), "work", "models"))
+        _MODEL = TextEmbedding(EMBED_MODEL, cache_dir=cache)
+    return _MODEL
+
+
+def load_vectors():
+    """(vectors, ids, fingerprints) from index/vectors.npz. None when missing, unreadable, or from another model."""
+    path = vector_path()
+    if not os.path.exists(path):
+        return None
+    try:
+        import numpy as np
+
+        with np.load(path, allow_pickle=False) as data:
+            vecs, ids, fps, model = data["vectors"], data["ids"], data["fps"], str(data["model"])
+    except Exception:
+        _note("ignored index/vectors.npz because it could not be read; run tools/embed.py")
+        return None
+    if model != EMBED_MODEL or vecs.ndim != 2 or not len(vecs) == len(ids) == len(fps):
+        _note("ignored index/vectors.npz because it does not match this version; run tools/embed.py")
+        return None
+    return vecs, ids, fps
+
+
+def vector_hits(q, n=40, topic=None, examples=True, ranking=None):
+    """Meaning-based hits from local embeddings, best first. Empty when vectors or libraries are missing.
+
+    A vector counts only when its chunk id still exists with the same
+    fingerprint. Topic filters apply before the top hits are taken.
+    """
+    ranking = ranking or load_ranking()
+    data = load_vectors()
+    if data is None:
         return []
     try:
         import numpy as np
-        from fastembed import TextEmbedding
+
+        model = _load_model()
     except Exception:
         return []
-    os.environ.setdefault("FASTEMBED_CACHE_PATH", os.path.join(home, "work", "models"))
-    vecs = np.load(vec_path, mmap_mode="r")
-    ids = np.load(os.path.join(home, "index", "vector_ids.npy"))
-    global _MODEL
-    if _MODEL is None:
-        _MODEL = TextEmbedding("BAAI/bge-small-en-v1.5", cache_dir=os.environ["FASTEMBED_CACHE_PATH"])
-    query = np.array(list(_MODEL.query_embed([vec_query(q)]))[0], dtype=np.float32)
-    norm = np.linalg.norm(query)
-    if norm:
-        query /= norm
-    sims = vecs @ query
-    order = np.argsort(-sims)[: n * 4]
+    vecs, ids, fps = data
+    hidden = set() if examples else ranking["hidden_topics"]
     out = []
-    with connect() as db:
-        for index in order:
+    with closing(connect()) as db:
+        current = {
+            cid: (fp, top)
+            for cid, fp, top in db.execute("select c.id, c.fp, d.topic from chunks c join docs d on d.doc_id = c.doc_id")
+        }
+        valid = np.zeros(len(ids), dtype=bool)
+        fresh = 0
+        for i, (cid, fp) in enumerate(zip(ids.tolist(), fps.tolist())):
+            row = current.get(cid)
+            if row is None or row[0] != fp:
+                continue
+            fresh += 1
+            if (topic and row[1] != topic) or row[1] in hidden:
+                continue
+            valid[i] = True
+        if fresh < len(current):
+            _note(f"{len(current) - fresh} chunks have no current vector; run tools/embed.py to add them")
+        if not valid.any():
+            return []
+        query = np.asarray(list(model.query_embed([vec_query(q)]))[0], dtype=np.float32)
+        length = np.linalg.norm(query)
+        if length:
+            query /= length
+        sims = np.where(valid, vecs @ query, -np.inf)
+        for index in np.argsort(-sims)[: n * 4]:
+            if not valid[index]:
+                break
             row = db.execute(
                 "select c.id,c.doc_id,c.page,c.text,d.title,d.topic,d.flags,d.page_label "
                 "from chunks c join docs d on d.doc_id=c.doc_id where c.id=?",
@@ -305,48 +459,45 @@ def vector_hits(q, n=40, topic=None, examples=True):
             ).fetchone()
             if not row:
                 continue
-            if topic and row[5] != topic:
-                continue
-            if not examples and row[5] in ("examples", "brochures"):
-                continue
-            out.append((float(sims[index]),) + tuple(row))
-            if len(out) >= n:
-                break
-    return out
+            weight = max(float(sims[index]), 0.0) * ranking["topic_weights"].get(row[5], 1.0)
+            weight *= demote(row[1], row[2], row[6], q, ranking)
+            out.append((weight,) + tuple(row))
+    out.sort(key=lambda hit: -hit[0])
+    return out[:n]
 
 
 def hybrid(q, k=5, topic=None, examples=True):
-    """Reciprocal-rank fusion of BM25 (exact words) and embeddings (meaning)."""
-    bm = search(q, 30, topic, examples)
-    vecs = vector_hits(q, 40, topic, examples)
+    """Reciprocal-rank fusion of BM25 (exact words) and embeddings (meaning). A keyword miss stays a miss."""
+    if k <= 0:
+        return [], "bm25"
+    if not os.path.exists(vector_path()):
+        return search(q, k, topic, examples), "bm25"
+    bm = search(q, max(30, k), topic, examples)
+    if not bm:
+        return [], "hybrid"
+    ranking = load_ranking()
+    vecs = vector_hits(q, 40, topic, examples, ranking)
     if not vecs:
         return search(q, k, topic, examples), "bm25"
-    query_terms = terms(q)
+    query_terms = terms(q, ranking)
     score, info = {}, {}
     for i, hit in enumerate(bm):
         key = (hit["doc_id"], hit["page"])
         score[key] = score.get(key, 0) + 1.0 / (RRF_BM + i)
         info[key] = hit
     seen = set()
-    for _sim, cid, doc, page, text, title, top, flags, label in vecs:
+    for _, _, doc, page, text, title, _, flags, label in vecs:
         key = (doc, page)
         if key in seen:
             continue
         seen.add(key)
         score[key] = score.get(key, 0) + VEC_W / (RRF_VEC + len(seen) - 1)
-        if key not in info:
-            info[key] = {
-                "doc_id": doc, "title": title, "page": page, "page_label": label,
-                "flags": flags, "passage": passage(text, query_terms),
-            }
-    with connect() as db:
-        for key, hit in info.items():
-            row = db.execute("select topic from docs where doc_id=?", (key[0],)).fetchone()
-            top = row[0] if row else ""
-            score[key] *= DOC_PRIOR.get(top, 1.0) * demote(key[0], key[1], hit.get("flags") or "", q)
-    ranked = sorted(score, key=lambda key: -score[key])[:k]
+        info.setdefault(key, {
+            "doc_id": doc, "title": title, "page": page, "page_label": label,
+            "flags": flags, "passage": passage(text, query_terms),
+        })
     out = []
-    for i, key in enumerate(ranked, 1):
+    for i, key in enumerate(sorted(score, key=lambda key: -score[key])[:k], 1):
         hit = dict(info[key])
         hit["rank"] = i
         hit["score"] = round(score[key] * 1000, 2)
@@ -354,15 +505,23 @@ def hybrid(q, k=5, topic=None, examples=True):
     return out, "hybrid"
 
 
+def _terms_pattern(query_terms):
+    words = sorted({term for term in query_terms if term}, key=len, reverse=True)
+    if not words:
+        return None
+    body = "|".join(r"\s+".join(map(re.escape, term.split())) for term in words)
+    return re.compile(r"(?<!\w)(?:" + body + r")(?!\w)", re.I)
+
+
 def passage(text, query_terms, width=700):
     folded_source = re.sub(r"[ \t]{2,}", "  ", text)
-    low = folded_source.lower()
+    pattern = _terms_pattern(query_terms)
+    starts = [m.start() for m in pattern.finditer(folded_source)] if pattern else []
     best, at = -1, 0
     for i in range(0, max(1, len(folded_source) - width + 1), 60):
-        window = low[i:i + width]
-        sc = sum(window.count(token) for token in query_terms)
-        if sc > best:
-            best, at = sc, i
+        count = bisect.bisect_left(starts, i + width) - bisect.bisect_left(starts, i)
+        if count > best:
+            best, at = count, i
     return ("…" if at else "") + folded_source[at:at + width].strip() + ("…" if at + width < len(folded_source) else "")
 
 
@@ -374,36 +533,54 @@ def annotate(hits):
     return hits
 
 
+def _positive(value):
+    number = int(value)
+    if number < 1:
+        raise argparse.ArgumentTypeError("must be 1 or more")
+    return number
+
+
+def open_page(doc_id, page):
+    """Print one stored page. Links inside text/ are not followed."""
+    try:
+        doc_id = safe_doc_id(doc_id)
+        page = int(page)
+        if page < 1:
+            raise ValueError("page must be 1 or more")
+    except ValueError as exc:
+        print(exc)
+        return 2
+    folder = os.path.join(text_root(), doc_id)
+    path = os.path.join(folder, f"p{page:04d}.txt")
+    if os.path.islink(folder) or os.path.islink(path) or not os.path.isfile(path) or not within(text_root(), path):
+        print(f"No stored page at text/{doc_id}/p{page:04d}.txt")
+        return 1
+    with open(path, encoding="utf-8", errors="replace") as handle:
+        sys.stdout.write(printable(handle.read()))
+    return 0
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description="Search a local jetpack index.")
     parser.add_argument("q", nargs="*")
-    parser.add_argument("-k", type=int, default=5)
+    parser.add_argument("-k", type=_positive, default=5, help="Number of passages to show (1 or more).")
     parser.add_argument("--topic")
     parser.add_argument("--json", action="store_true")
-    parser.add_argument("--no-examples", action="store_true")
+    parser.add_argument("--no-examples", action="store_true", help="Leave out topics listed as hidden_topics (default: examples).")
     parser.add_argument("--mode", choices=["auto", "bm25", "hybrid"], default="auto")
     parser.add_argument("--open", nargs=2, metavar=("DOC_ID", "PAGE"))
     parser.add_argument("--list", action="store_true")
     args = parser.parse_args(argv)
+    del NOTES[:]
     try:
-        if args.list:
-            with connect() as db:
-                for row in db.execute("select doc_id,topic,pages,flags,title from docs order by topic,doc_id"):
-                    print(f"{row[0]:42s} {row[1]:10s} {row[2]:4d}p  {row[3]:16s} {row[4]}")
-            return 0
         if args.open:
-            try:
-                doc_id = safe_doc_id(args.open[0])
-                page = int(args.open[1])
-            except ValueError as exc:
-                print(exc)
-                return 2
-            path = os.path.join(jetpack_home(), "text", doc_id, f"p{page:04d}.txt")
-            if not os.path.isfile(path):
-                print(f"No stored page at text/{doc_id}/p{page:04d}.txt")
-                return 1
-            with open(path, encoding="utf-8") as handle:
-                sys.stdout.write(handle.read())
+            return open_page(*args.open)
+        if args.list:
+            with closing(connect()) as db:
+                for doc, topic, pages, flags, title in db.execute(
+                    "select doc_id,topic,pages,flags,title from docs order by topic,doc_id"
+                ):
+                    print(f"{doc:42s} {printable(topic):10s} {pages or 0:4d}p  {printable(flags):16s} {printable(title)}")
             return 0
         question = " ".join(args.q)
         examples = not args.no_examples
@@ -412,6 +589,8 @@ def main(argv=None):
         else:
             hits, mode = hybrid(question, args.k, args.topic, examples)
         annotate(hits)
+        for note in NOTES:
+            print("note: " + note, file=sys.stderr)
         if args.json:
             print(json.dumps({"question": question, "mode": mode, "hits": hits}, indent=1))
             return 0
@@ -419,12 +598,15 @@ def main(argv=None):
             print("Not in the jetpack (no matching passages).")
             return 0
         for hit in hits:
-            tag = f" [{hit['flags']}]" if hit.get("flags") else ""
+            tag = f" [{printable(hit['flags'])}]" if hit.get("flags") else ""
             label = "p." if hit.get("page_label") == "page" else str(hit.get("page_label") or "p.") + " "
             warn = ("    NOTE: " + hit["note"] + "\n") if hit.get("note") else ""
-            print(f"[{hit['rank']}] {hit['title']} — {label}{hit['page']}{tag}  (score {hit['score']})\n{warn}    {hit['passage']}\n")
+            print(
+                f"[{hit['rank']}] {printable(hit['title'])} — {label}{hit['page']}{tag}  (score {hit['score']})\n"
+                f"{warn}    {printable(hit['passage'])}\n"
+            )
         return 0
-    except FileNotFoundError as exc:
+    except IndexUnavailable as exc:
         print(exc)
         return 1
 
