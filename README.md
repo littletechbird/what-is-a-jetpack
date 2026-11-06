@@ -14,7 +14,7 @@ A typical RAG retrieves chunks of text and then freely generates an answer.
 
 A jetpack keeps the library with you, wherever you choose to store it. It indexes the files, by words and optionally by meaning. A query returns the matching pages and citations. If nothing fits, it should say so. Writing a normal paragraph from those passages is a separate, optional step, and it should stay faithful to what was retrieved.
 
-We also apply the same idea to sleep. At the end of a long day, instead of keeping the whole conversation loaded, we store a short handoff of what got done, what is still open, and where the files live. The next day starts fresh and reads those notes.
+We also apply the same idea to sleep. That is a written procedure we use with the jetpack, not something every agent comes with. At the end of a long day, instead of keeping the whole conversation loaded, we store a short handoff of what got done, what is still open, and where the files live, plus a seed of the standing rules a fresh start has to know. The next day begins by reading those files. The write-up is in docs/sleep.md. The companion rule, that the jetpack is home and the chat is not, is in docs/home.md.
 
 Jev does not store or index your files. A jetpack does. Jev returns a judgment and a confidence. A jetpack returns the source page. Both exist so a person does not have to read a huge pile to get an answer.
 
