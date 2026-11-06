@@ -1,0 +1,19 @@
+# Where the files live
+
+This is a written rule we use with a jetpack. It is not something every agent comes with.
+
+A jetpack is useful only if the files actually live somewhere you can find again. Chat is a working window. Scratch space on a machine that can be wiped is also a working window. Neither one is home.
+
+Home is the storage you chose for the library: a local disk, a networked drive, cloud storage, a phone, or a connected thumb drive. Those choices are described in the main [readme](../README.md). If a file matters, a copy of it belongs there before the work counts as done.
+
+In practice that means:
+
+- Create or edit in scratch if you need to.
+- Land a lasting copy on the storage you chose.
+- Record where that copy lives (a path, or an id in cloud storage).
+- Only then call the work done, attach it, or send it.
+- Do not delete a file you worked on unless that lasting copy already exists.
+
+An automatic summary of a chat is not the archive, and it is not the memory of record for a locked decision. Write the decision into the seed or the handoff, and keep the real files in the jetpack.
+
+If disk space on a scratch machine starts to run out, treat that as a warning that the lasting copies were not made, not as a reason to start throwing away the only copy of something useful.
