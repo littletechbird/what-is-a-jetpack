@@ -5,9 +5,17 @@ work/
 *.db
 vectors.npy
 vector_ids.npy
+vector_keys.npy
 *.npy
 catalog.csv
-redact_terms.local.json
+results.json
+
+redact_terms*.json
+!redact_terms.example.json
+ranking.local.json
+*.swp
+*~
+*.bak
 
 __pycache__/
 *.pyc
@@ -27,5 +35,9 @@ __pycache__/
 !requirements.txt
 *.csv
 *.zip
+*.eml
+*.msg
+*.rtf
+*.odt
 extracts/
 intake/

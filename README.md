@@ -35,13 +35,15 @@ python tools/ingest.py
 python tools/ask.py "your question"
 ```
 
-On Windows, activate the virtual environment with `.venv\Scripts\activate`.
+On Windows, activate the virtual environment with `.venv\Scripts\activate`. requirements.txt does not pin versions, so pip installs the current releases.
 
-Each page is split into chunks of about 1000 characters, with about 150 characters of overlap. A chunk stays on its own page. Ask prints the matching documents, the page numbers, and a short passage. If the index has no fitting passage, it says so. `python tools/ask.py --list` lists what ingest stored. `python tools/ask.py --open DOC_ID PAGE` prints one stored page.
+Each page is split into chunks of about 1000 characters, with about 150 characters of overlap. A chunk stays on its own page, and the end of a page is always kept. Ask prints the matching documents, the page numbers, and a short passage. If the index has no fitting passage, it says so. `python tools/ask.py --list` lists what ingest stored. `python tools/ask.py --open DOC_ID PAGE` prints one stored page.
+
+Ingest rebuilds the documents that came from the library. It builds the new database and page files beside the old ones and swaps them in only when the run finishes, so a failed run leaves the previous index alone. A file removed from the library leaves text/ and the index on the next run. Symlinks, special files, and files over 80 MiB are skipped. A document keeps its id across runs, and doc ids are lowercase.
 
 You can point ingest at a different folder: `python tools/ingest.py /path/to/your/files`. The index is still written under the jetpack home.
 
-JETPACK_HOME is that home. It is the folder that holds library, text, index, and work. When the variable is unset, the home is the root of this repository. Set it when the files should live somewhere else:
+JETPACK_HOME is that home. It is the folder that holds library, text, index, and work. When the variable is unset, the home is the root of this repository; those folders are gitignored, and the tools print a reminder on stderr when the home is inside a git checkout. Set it when the files should live somewhere else:
 
 ```bash
 export JETPACK_HOME=/path/to/your/jetpack
@@ -50,7 +52,7 @@ python tools/ingest.py
 python tools/ask.py "your question"
 ```
 
-An optional embedding pass ranks by meaning and blends that rank with the keyword rank. It uses the BAAI/bge-small-en-v1.5 model through fastembed, on CPU, and caches the model under work/models. There is no paid search API. Skip this step and ask still answers from keywords.
+An optional embedding pass ranks by meaning and blends that rank with the keyword rank. It uses the BAAI/bge-small-en-v1.5 model through fastembed, on CPU, and caches the model under work/models. There is no paid search API. Skip this step and ask still answers from keywords. Run it again after ingest or reindex: ingest deletes old vectors, and ask ignores a vector whose chunk changed. A passage found only by meaning has to be close to the question, so an unrelated question still gets "Not in the jetpack".
 
 ```bash
 python tools/embed.py
@@ -59,8 +61,12 @@ python tools/ask.py "your question"
 
 `python tools/ask.py --mode bm25` forces keyword rank even after vectors exist. A file in library/safety/ is stored with topic safety, and `--topic safety` limits the search to that folder's documents.
 
-tools/reindex.py rebuilds chunks after you edit files in text/. tools/add_standard.py adds one PDF, Word, HTML, or text file to an index that already exists. tools/remove_docs.py removes a document once another document is indexed in its place: `python tools/remove_docs.py old-id=new-id`.
+Ranking treats every topic the same unless you add a ranking.local.json file to the jetpack home. Copy ranking.example.json to that name and edit the copy; the local file is gitignored. `topic_weights` multiplies the score of a topic, `demote_prefixes` lowers documents whose id starts with a prefix unless the question matches the rule's pattern, and `exclude_topics` lists the topics that `--no-examples` leaves out.
 
-tools/redact.py replaces email addresses, URLs, phone numbers, and street-like addresses. Extra literal words and phrases, such as organization names, belong in redact_terms.local.json. Copy redact_terms.example.json to that name and edit the copy. The local file is gitignored. `python tools/ingest.py --redact` applies the same scrub while indexing.
+tools/reindex.py rebuilds chunks after you edit files in text/, and drops chunks for page files you deleted. `--dry-run` reports what would change and writes nothing. tools/add_standard.py adds one PDF, Word, HTML, or text file to an index that already exists, and that document stays through later ingest runs. tools/remove_docs.py removes a document once another document is indexed in its place: `python tools/remove_docs.py old-id=new-id`.
+
+tools/redact.py replaces email addresses, URLs and bare domains, phone numbers, and street-like addresses. Extra literal words and phrases, such as organization names, belong in redact_terms.local.json in the jetpack home. Copy redact_terms.example.json to that name and edit the copy; a plain JSON list of strings also works. The local file is gitignored. `python tools/ingest.py --redact` applies the same scrub while indexing, to the text and to the titles and topics taken from file and folder names. With --redact, doc ids become hashes and file names are not stored. `python tools/add_standard.py FILE ID "Title" --redact` does the same for one file; without --redact it stores the text as it is.
 
 The code is under the MIT license in LICENSE.
+
+PyMuPDF (the pdf reader) is licensed under AGPL-3.0; this repository's own code stays MIT. See LICENSE.

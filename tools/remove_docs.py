@@ -3,16 +3,15 @@
 
 Usage: python tools/remove_docs.py OLD_ID=NEW_ID [...]
 
-Refuses to remove OLD_ID unless NEW_ID already has chunks.
+Refuses to remove OLD_ID unless NEW_ID is a different document that already has chunks.
 """
 import csv
 import datetime
 import os
-import shutil
-import sqlite3
 import sys
 
-from home import jetpack_home, safe_doc_id
+from home import jetpack_home, remove_path, safe_doc_id
+from ingest import connect_db
 
 
 def main(argv=None):
@@ -25,48 +24,51 @@ def main(argv=None):
     db_file = os.path.join(home, "index", "jetpack.db")
     if not os.path.exists(db_file):
         sys.exit(f"No jetpack index at {db_file}. Run tools/ingest.py first.")
-    db = sqlite3.connect(db_file)
+    try:
+        db = connect_db(db_file)
+    except RuntimeError as exc:
+        sys.exit(str(exc))
     log = []
+    refused = 0
     try:
         for arg in argv:
             if "=" not in arg:
                 print("REFUSED", arg, "- want OLD_ID=NEW_ID")
+                refused += 1
                 continue
-            old, new = arg.split("=", 1)
+            old, new = (part.strip().lower() for part in arg.split("=", 1))
             try:
                 old = safe_doc_id(old)
                 new = safe_doc_id(new)
             except ValueError as exc:
                 print("REFUSED", exc)
+                refused += 1
+                continue
+            if old == new:
+                print("REFUSED", old, "- a document cannot replace itself")
+                refused += 1
                 continue
             n_new = db.execute("select count(*) from chunks where doc_id=?", (new,)).fetchone()[0]
             if not n_new:
                 print("REFUSED", old, "- newer", new, "not indexed")
+                refused += 1
                 continue
             row = db.execute("select title from docs where doc_id=?", (old,)).fetchone()
             if not row:
                 print("absent", old)
                 continue
-            chunks = db.execute("select id, text from chunks where doc_id=?", (old,)).fetchall()
-            for cid, text in chunks:
-                db.execute(
-                    "insert into chunks_fts(chunks_fts, rowid, text, title) values('delete', ?, ?, ?)",
-                    (cid, text, row[0]),
-                )
-            db.execute("delete from chunks where doc_id=?", (old,))
+            n_old = db.execute("delete from chunks where doc_id=?", (old,)).rowcount
             db.execute("delete from docs where doc_id=?", (old,))
-            try:
-                db.execute("delete from page_flags where doc_id=?", (old,))
-            except sqlite3.Error:
-                pass
-            shutil.rmtree(os.path.join(home, "text", old), ignore_errors=True)
-            log.append([datetime.datetime.now().isoformat(timespec="seconds"), old, row[0], len(chunks), new])
-            print("removed", old, len(chunks), "chunks; superseded by", new)
+            db.execute("delete from page_flags where doc_id=?", (old,))
+            log.append([datetime.datetime.now().isoformat(timespec="seconds"), old, row[0], n_old, new])
+            print("removed", old, n_old, "chunks; superseded by", new)
         db.commit()
         db.execute("insert into chunks_fts(chunks_fts) values('optimize')")
         db.commit()
     finally:
         db.close()
+    for item in log:
+        remove_path(os.path.join(home, "text", item[1]))
     catalog = os.path.join(home, "index", "catalog.csv")
     gone = {item[1] for item in log}
     if gone and os.path.exists(catalog):
@@ -82,7 +84,7 @@ def main(argv=None):
             if new_file:
                 writer.writerow(["when", "doc_id", "title", "chunks", "superseded_by"])
             writer.writerows(log)
-    return 0
+    return 1 if refused else 0
 
 
 if __name__ == "__main__":

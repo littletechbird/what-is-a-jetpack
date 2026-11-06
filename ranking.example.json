@@ -1,0 +1,7 @@
+{
+  "topic_weights": {"safety": 1.1, "standards": 1.05},
+  "demote_prefixes": [
+    {"prefix": "standards-", "pattern": "\\bstandards?\\b", "weight": 0.9}
+  ],
+  "exclude_topics": ["examples"]
+}
