@@ -46,3 +46,17 @@ The agent can write the files. That part is reversible. Starting a fresh copy, p
 Skip sleep while a send, merge, or other live irreversible step is still in flight. Finish or park that first. By default, run it once when the day is done, or when someone asks for a fresh start.
 
 Sleep is done when the handoff and seed are on disk, the durable copies exist, nothing irreversible is half-done, and a new session could wake from the files alone.
+
+## Commands
+
+tools/sleep.py writes and checks the two files. They are state/handoff.md and state/seed.md under JETPACK_HOME. When JETPACK_HOME is unset, that home is the repository root.
+
+```bash
+python tools/sleep.py init
+python tools/sleep.py write-handoff notes.md
+python tools/sleep.py write-seed rules.md
+python tools/sleep.py twin /path/to/durable
+python tools/sleep.py wake
+```
+
+`init` creates the handoff and the seed from short templates when those files are not there yet. `write-handoff` and `write-seed` store the text you pass in. A second write keeps a dated backup beside the previous file, named like handoff.md.bak-YYYY-MM-DD. `twin` copies both files into another folder so the durable storage has them too. `wake` checks that the handoff and the seed exist, then checks each file pointer listed under Pointers. It prints a missing pointer path when one is gone. When the handoff, the seed, and those paths are all present, the command exits successfully.

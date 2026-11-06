@@ -263,11 +263,25 @@ class TreeTests(unittest.TestCase):
             "redact_terms.local.json",
             "notes.docx",
             "archive.zip",
+            "state/handoff.md",
+            "state/seed.md",
+            "state/handoff.md.bak-2026-11-06",
+            "kept/notes.md",
         ]
         for rel in ignored:
             result = subprocess.run(["git", "check-ignore", "-q", rel], cwd=ROOT)
             self.assertEqual(result.returncode, 0, rel)
-        for rel in ("README.md", "LICENSE", "docs/jev-and-a-jetpack.jpg", "redact_terms.example.json", "requirements.txt", "tools/ask.py"):
+        for rel in (
+            "README.md",
+            "LICENSE",
+            "docs/jev-and-a-jetpack.jpg",
+            "redact_terms.example.json",
+            "requirements.txt",
+            "tools/ask.py",
+            "tools/home.py",
+            "tools/sleep.py",
+            "tools/keep.py",
+        ):
             result = subprocess.run(["git", "check-ignore", "-q", rel], cwd=ROOT)
             self.assertNotEqual(result.returncode, 0, rel)
 

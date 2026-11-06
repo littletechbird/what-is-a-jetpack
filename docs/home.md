@@ -17,3 +17,14 @@ In practice that means:
 An automatic summary of a chat is not the archive, and it is not the memory of record for a locked decision. Write the decision into the seed or the handoff, and keep the real files in the jetpack.
 
 If disk space on a scratch machine starts to run out, treat that as a warning that the lasting copies were not made, not as a reason to start throwing away the only copy of something useful.
+
+## Commands
+
+tools/keep.py is the command for this rule. It copies a file into kept/ under JETPACK_HOME. That folder is the lasting copy.
+
+```bash
+python tools/keep.py path/to/file
+python tools/keep.py --check path/to/file
+```
+
+The first command lands the file in kept/. `--check` looks for a copy that is already inside the jetpack home and fails when the only copy is still outside it. A destination name that would leave the keep folder, such as `--as ../escape`, is refused.
