@@ -13,7 +13,7 @@ import os
 import shutil
 import sys
 
-from home import jetpack_home
+from home import jetpack_home, within
 
 
 def kept_dir():
@@ -22,21 +22,13 @@ def kept_dir():
     return path
 
 
-def within(parent, path):
-    parent = os.path.abspath(parent)
-    path = os.path.abspath(path)
-    try:
-        return os.path.commonpath([parent, path]) == parent
-    except ValueError:
-        return False
-
-
 def dest_for(source, dest_root, name):
     base = name or os.path.basename(os.path.abspath(source.rstrip(os.sep)))
     if not base or base in (".", ".."):
         sys.exit("could not pick a destination name")
     dest = os.path.abspath(os.path.join(dest_root, base))
-    if not within(dest_root, dest):
+    # Real paths, so a link inside the keep folder cannot carry the copy outside it.
+    if not within(dest_root, dest) or os.path.realpath(dest) == os.path.realpath(dest_root):
         sys.exit("destination would leave the keep folder")
     return dest
 
@@ -63,6 +55,7 @@ def lasting_copy(source, dest_root=None, name=None):
     dest = dest_for(source, dest_root, name)
     if os.path.exists(dest):
         return dest
+    # A link inside the home that points outside it is not a lasting copy.
     if within(jetpack_home(), source) and os.path.exists(source):
         return source
     return None

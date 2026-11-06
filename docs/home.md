@@ -27,4 +27,4 @@ python tools/keep.py path/to/file
 python tools/keep.py --check path/to/file
 ```
 
-The first command lands the file in kept/. `--check` looks for a copy that is already inside the jetpack home and fails when the only copy is still outside it. A destination name that would leave the keep folder, such as `--as ../escape`, is refused.
+The first command lands the file in kept/. `--check` looks for a copy that is already inside the jetpack home and fails when the only copy is still outside it. A destination name that would leave the keep folder, such as `--as ../escape`, is refused. Links are resolved first: a link inside kept/ that points somewhere else is refused as a destination, and a link inside the home that points outside it does not count as a lasting copy. kept/ itself may be a link to another drive.
