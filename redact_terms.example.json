@@ -1,0 +1,6 @@
+{
+  "terms": [
+    {"match": "Acme Corp", "replacement": "[ORG]"},
+    {"match": "Jane Doe", "replacement": "[NAME]"}
+  ]
+}

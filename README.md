@@ -21,3 +21,46 @@ Jev does not store or index your files. A jetpack does. Jev returns a judgment a
 TypeSafe's introduction to Jev is at https://typesafe.ai/blog/introducing-system-one-models-and-jev
 
 TypeSafe's note about not calling it a decision model is at https://typesafe.ai/blog/dont-call-it-a-decision-model
+
+## Run it
+
+The code under tools/ builds a jetpack from documents you choose. Put PDF, Word, HTML, or plain text files in a folder named library. A form feed in a text file starts a new page. Ingest reads that folder, writes one text file per page under text/, and builds index/jetpack.db. SQLite FTS5 is the keyword index. Python 3.11 or newer is enough for that part, as long as the standard-library SQLite includes FTS5, which it does in normal builds.
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+mkdir -p library
+python tools/ingest.py
+python tools/ask.py "your question"
+```
+
+On Windows, activate the virtual environment with `.venv\Scripts\activate`.
+
+Each page is split into chunks of about 1000 characters, with about 150 characters of overlap. A chunk stays on its own page. Ask prints the matching documents, the page numbers, and a short passage. If the index has no fitting passage, it says so. `python tools/ask.py --list` lists what ingest stored. `python tools/ask.py --open DOC_ID PAGE` prints one stored page.
+
+You can point ingest at a different folder: `python tools/ingest.py /path/to/your/files`. The index is still written under the jetpack home.
+
+JETPACK_HOME is that home. It is the folder that holds library, text, index, and work. When the variable is unset, the home is the root of this repository. Set it when the files should live somewhere else:
+
+```bash
+export JETPACK_HOME=/path/to/your/jetpack
+mkdir -p "$JETPACK_HOME/library"
+python tools/ingest.py
+python tools/ask.py "your question"
+```
+
+An optional embedding pass ranks by meaning and blends that rank with the keyword rank. It uses the BAAI/bge-small-en-v1.5 model through fastembed, on CPU, and caches the model under work/models. There is no paid search API. Skip this step and ask still answers from keywords.
+
+```bash
+python tools/embed.py
+python tools/ask.py "your question"
+```
+
+`python tools/ask.py --mode bm25` forces keyword rank even after vectors exist. A file in library/safety/ is stored with topic safety, and `--topic safety` limits the search to that folder's documents.
+
+tools/reindex.py rebuilds chunks after you edit files in text/. tools/add_standard.py adds one PDF, Word, HTML, or text file to an index that already exists. tools/remove_docs.py removes a document once another document is indexed in its place: `python tools/remove_docs.py old-id=new-id`.
+
+tools/redact.py replaces email addresses, URLs, phone numbers, and street-like addresses. Extra literal words and phrases, such as organization names, belong in redact_terms.local.json. Copy redact_terms.example.json to that name and edit the copy. The local file is gitignored. `python tools/ingest.py --redact` applies the same scrub while indexing.
+
+The code is under the MIT license in LICENSE.
