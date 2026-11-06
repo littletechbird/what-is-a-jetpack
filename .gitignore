@@ -2,6 +2,8 @@ index/
 text/
 library/
 work/
+state/
+kept/
 *.db
 vectors.npy
 vector_ids.npy

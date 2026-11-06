@@ -14,7 +14,7 @@ A typical RAG retrieves chunks of text and then freely generates an answer.
 
 A jetpack keeps the library with you, wherever you choose to store it. It indexes the files, by words and optionally by meaning. A query returns the matching pages and citations. If nothing fits, it should say so. Writing a normal paragraph from those passages is a separate, optional step, and it should stay faithful to what was retrieved.
 
-We also apply the same idea to sleep. That is a written procedure we use with the jetpack, not something every agent comes with. At the end of a long day, instead of keeping the whole conversation loaded, we store a short handoff of what got done, what is still open, and where the files live, plus a seed of the standing rules a fresh start has to know. The next day begins by reading those files. The write-up is in docs/sleep.md. The companion rule, that the jetpack is home and the chat is not, is in docs/home.md.
+We also apply the same idea to sleep. That is a written procedure we use with the jetpack, not something every agent comes with. At the end of a long day, instead of keeping the whole conversation loaded, we store a short handoff of what got done, what is still open, and where the files live, plus a seed of the standing rules a fresh start has to know. The next day begins by reading those files. The write-up is in docs/sleep.md. The companion rule, that the jetpack is home and the chat is not, is in docs/home.md. The code for those two procedures is tools/sleep.py and tools/keep.py.
 
 Jev does not store or index your files. A jetpack does. Jev returns a judgment and a confidence. A jetpack returns the source page. Both exist so a person does not have to read a huge pile to get an answer.
 
@@ -41,7 +41,7 @@ Each page is split into chunks of about 1000 characters, with about 150 characte
 
 You can point ingest at a different folder: `python tools/ingest.py /path/to/your/files`. The index is still written under the jetpack home.
 
-JETPACK_HOME is that home. It is the folder that holds library, text, index, and work. When the variable is unset, the home is the root of this repository. Set it when the files should live somewhere else:
+JETPACK_HOME is that home. It is the folder that holds library, text, index, work, state, and kept. When the variable is unset, the home is the root of this repository. Set it when the files should live somewhere else:
 
 ```bash
 export JETPACK_HOME=/path/to/your/jetpack
@@ -62,5 +62,17 @@ python tools/ask.py "your question"
 tools/reindex.py rebuilds chunks after you edit files in text/. tools/add_standard.py adds one PDF, Word, HTML, or text file to an index that already exists. tools/remove_docs.py removes a document once another document is indexed in its place: `python tools/remove_docs.py old-id=new-id`.
 
 tools/redact.py replaces email addresses, URLs, phone numbers, and street-like addresses. Extra literal words and phrases, such as organization names, belong in redact_terms.local.json. Copy redact_terms.example.json to that name and edit the copy. The local file is gitignored. `python tools/ingest.py --redact` applies the same scrub while indexing.
+
+tools/sleep.py writes state/handoff.md and state/seed.md under JETPACK_HOME. tools/keep.py copies a file into kept/ in that same home. Real handoff, seed, and kept files stay out of git.
+
+```bash
+python tools/sleep.py init
+python tools/sleep.py write-handoff notes.md
+python tools/sleep.py write-seed rules.md
+python tools/sleep.py twin /path/to/durable
+python tools/sleep.py wake
+python tools/keep.py path/to/file
+python tools/keep.py --check path/to/file
+```
 
 The code is under the MIT license in LICENSE.
