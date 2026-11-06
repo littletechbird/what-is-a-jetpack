@@ -37,11 +37,15 @@ python tools/ask.py "your question"
 
 On Windows, activate the virtual environment with `.venv\Scripts\activate`.
 
-Each page is split into chunks of about 1000 characters, with about 150 characters of overlap. A chunk stays on its own page. Ask prints the matching documents, the page numbers, and a short passage. If the index has no fitting passage, it says so. `python tools/ask.py --list` lists what ingest stored. `python tools/ask.py --open DOC_ID PAGE` prints one stored page.
+Each page is split into chunks of at most 1000 characters, with about 150 characters of overlap. A chunk stays on its own page. No text is dropped: a short page such as "DANGER 480 V" is indexed, and so is a page with no spaces. Ask prints the matching documents, the page numbers, and a short passage. If the index has no fitting passage, it says so. `python tools/ask.py --list` lists what ingest stored. `python tools/ask.py --open DOC_ID PAGE` prints one stored page. Control characters in file names and text are removed before they are stored or printed.
 
-You can point ingest at a different folder: `python tools/ingest.py /path/to/your/files`. The index is still written under the jetpack home.
+You can point ingest at a different folder: `python tools/ingest.py /path/to/your/files`. The index is still written under the jetpack home. Ingest refuses to index the jetpack home itself or its text, index, work, state, and kept folders.
 
-JETPACK_HOME is that home. It is the folder that holds library, text, index, work, state, and kept. When the variable is unset, the home is the root of this repository. Set it when the files should live somewhere else:
+Ingest builds the new index next to the old one and swaps it in only when it is complete. If the run is stopped or fails partway, the previous index and page text stay as they were. Ingest reads only regular files whose real path stays inside the library folder. A link that points outside it, a linked folder, a pipe, or a device is skipped and named in the output, and ingest then exits with status 1. A file that cannot be read, a text file over 64 MB, and a Word file that would expand past the size limit are skipped the same way. HTML is parsed, so comments, attributes, scripts, and styles are not indexed. Word tables stay in document order, and headers, footers, and text boxes are read.
+
+Each run keeps the doc id a file had last time, so adding a-b.pdf next to a-b.txt does not rename the older document. The stored text of a file you removed from the library is deleted. Documents added with tools/add_standard.py are kept.
+
+JETPACK_HOME is that home. It is the folder that holds library, text, index, work, state, and kept. When the variable is unset, the home is the root of this repository. The generated folders are gitignored, but a private library is safer outside the git work tree. Set it when the files should live somewhere else:
 
 ```bash
 export JETPACK_HOME=/path/to/your/jetpack
@@ -57,11 +61,29 @@ python tools/embed.py
 python tools/ask.py "your question"
 ```
 
-`python tools/ask.py --mode bm25` forces keyword rank even after vectors exist. A file in library/safety/ is stored with topic safety, and `--topic safety` limits the search to that folder's documents.
+The vectors are stored in index/vectors.npz, each with its chunk id and a fingerprint of the chunk's title and text. Ask uses a vector only while that fingerprint still matches, so an edited or rebuilt index never cites a page through an old vector. Chunk ids are not reused. Ingest deletes the vectors when it rebuilds the index, so run tools/embed.py again afterwards; chunks it has seen before come from its cache. After tools/reindex.py or tools/add_standard.py, the changed chunks fall back to keywords until you embed again. When keyword search finds nothing, the answer is a miss in hybrid mode too.
 
-tools/reindex.py rebuilds chunks after you edit files in text/. tools/add_standard.py adds one PDF, Word, HTML, or text file to an index that already exists. tools/remove_docs.py removes a document once another document is indexed in its place: `python tools/remove_docs.py old-id=new-id`.
+`python tools/ask.py --mode bm25` forces keyword rank even after vectors exist. A file in library/safety/ is stored with topic safety, and `--topic safety` limits the search to that folder's documents. Queries can use any language the index holds, such as "Prüfung" or "絶縁抵抗", and accents are optional.
 
-tools/redact.py replaces email addresses, URLs, phone numbers, and street-like addresses. Extra literal words and phrases, such as organization names, belong in redact_terms.local.json. Copy redact_terms.example.json to that name and edit the copy. The local file is gitignored. `python tools/ingest.py --redact` applies the same scrub while indexing.
+Ranking is neutral by default. Only table-of-contents and back-of-book index pages, and documents flagged superseded, are weighted down. Weights for your own folder scheme go in ranking.local.json in the jetpack home. Copy ranking.example.json to that name and edit the copy. It can weight topics, weight doc ids that start with a prefix unless the query matches a pattern, hide topics from `--no-examples`, change the page weights, and add synonyms. The local file is gitignored. A file ask cannot read is ignored with a note.
+
+tools/reindex.py rebuilds chunks after you edit files in text/. It drops the chunks of page files you deleted, and a document whose text folder is gone. Like ingest, it marks contents and back-of-book index pages so ask can weight them down. A page titled "Polarization Index" is not a back-of-book index. `--dry-run` reports what would change and writes nothing.
+
+tools/add_standard.py adds one PDF, Word, HTML, or text file to an index that already exists. Adding a doc id that already exists replaces that document, title and pages included. The document is searchable right away.
+
+```bash
+python tools/add_standard.py path/to/file.pdf doc-id "Title" [flags] [topic] [--redact]
+```
+
+tools/remove_docs.py removes a document once another document is indexed in its place: `python tools/remove_docs.py old-id=new-id`. The two ids must differ.
+
+tools/redact.py replaces email addresses, URLs and bare domains, phone numbers, and street-like addresses. Text is Unicode-normalized first, so full-width characters, non-breaking spaces, and dash variants are caught, and so is an email split across a line. Measurements are left alone: "3 phase CT polarity" is not an address, and "240 480 4160 V" is not a phone number. Digits separated only by plain spaces count as a phone after a label such as "Tel:", or when they are joined by non-breaking spaces. These are patterns, not a guarantee, so check the output before you share it.
+
+Extra literal words and phrases, such as organization names, belong in redact_terms.local.json in the jetpack home. Copy redact_terms.example.json to that name and edit the copy. The local file is gitignored. The file is read from the jetpack home, or from `--terms path`, never from the current folder. A term matches whole words in any case, and a space in a term also matches a line break or a run of spaces. Replacements are used as written.
+
+`python tools/ingest.py --redact` applies the same scrub while indexing, to page text and also to titles, doc ids, folder names, source paths, and catalog.csv. tools/add_standard.py redacts only when given `--redact`. With `--redact` and no terms file, ingest warns and runs the built-in patterns. If the terms file cannot be read, ingest stops with status 2 and add_standard stops before adding anything. The previous index is unchanged.
+
+An index built by an earlier version of these tools is not read. Ask says so. Run tools/ingest.py to rebuild it, run tools/add_standard.py again for documents you added that way, and then run tools/embed.py if you use vectors.
 
 tools/sleep.py writes state/handoff.md and state/seed.md under JETPACK_HOME. tools/keep.py copies a file into kept/ in that same home. Real handoff, seed, and kept files stay out of git.
 
@@ -75,4 +97,10 @@ python tools/keep.py path/to/file
 python tools/keep.py --check path/to/file
 ```
 
-The code is under the MIT license in LICENSE.
+The tests use synthetic documents and a temporary jetpack home, and do not download the embedding model:
+
+```bash
+python -m unittest discover -s tests
+```
+
+The code is under the MIT license in LICENSE. The libraries in requirements.txt keep their own licenses. PyMuPDF, which reads PDF files, is AGPL-3.0 unless you hold a commercial license from Artifex, so check its terms before you ship it inside a product or a hosted service.

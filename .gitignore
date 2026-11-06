@@ -5,11 +5,38 @@ work/
 state/
 kept/
 *.db
+*.db-journal
+*.db-wal
+*.db-shm
 vectors.npy
 vector_ids.npy
 *.npy
+*.npz
 catalog.csv
-redact_terms.local.json
+
+# Local settings and anything saved from a search. Only the examples are tracked.
+redact_terms*.json
+ranking*.json
+*.json
+*.jsonl
+!redact_terms.example.json
+!ranking.example.json
+
+# Editor backups, swap files, and lock files next to private settings.
+*~
+*.swp
+*.swo
+*.swx
+*.bak
+*.bak-*
+*.orig
+*.tmp
+.~lock.*#
+~$*
+
+# Notes written in the repository root, such as a handoff draft. README stays tracked.
+/*.md
+!/README.md
 
 __pycache__/
 *.pyc

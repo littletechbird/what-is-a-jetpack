@@ -164,6 +164,56 @@ class SleepKeepTests(unittest.TestCase):
         self.assertFalse(os.path.exists(os.path.join(self.home, "kept", "escape")))
         self.assertFalse(os.path.exists(os.path.join(self.tmp.name, "escape")))
 
+    def test_keep_refuses_a_name_that_is_the_keep_folder_itself(self):
+        source = os.path.join(self.scratch, "field-note.md")
+        write(source, "Stay a file.\n")
+        result = self.keep("--as", "sub/..", source)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("leave the keep folder", result.stderr)
+        self.assertEqual(os.listdir(os.path.join(self.home, "kept")), [])
+
+    @unittest.skipUnless(hasattr(os, "symlink") and os.name == "posix", "needs symlinks")
+    def test_keep_does_not_write_through_a_link_that_leaves_the_keep_folder(self):
+        source = os.path.join(self.scratch, "field-note.md")
+        write(source, "Copy me.\n")
+        outside = os.path.join(self.scratch, "outside.md")
+        write(outside, "Leave me alone.\n")
+        os.makedirs(os.path.join(self.home, "kept"))
+        os.symlink(outside, os.path.join(self.home, "kept", "trap.md"))
+        os.symlink(self.scratch, os.path.join(self.home, "kept", "trapdir"))
+        for name in ("trap.md", "trapdir/field-note.md"):
+            result = self.keep("--as", name, source)
+            self.assertNotEqual(result.returncode, 0, name)
+            self.assertIn("leave the keep folder", result.stderr)
+        self.assertEqual(read(outside), "Leave me alone.\n")
+        self.assertFalse(os.path.exists(os.path.join(self.scratch, "trapdir")))
+
+    @unittest.skipUnless(hasattr(os, "symlink") and os.name == "posix", "needs symlinks")
+    def test_a_kept_folder_that_is_a_link_to_another_drive_still_works(self):
+        drive = os.path.join(self.tmp.name, "drive")
+        os.makedirs(drive)
+        os.symlink(drive, os.path.join(self.home, "kept"))
+        source = os.path.join(self.scratch, "field-note.md")
+        write(source, "On the other drive.\n")
+        result = self.keep(source)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(read(os.path.join(drive, "field-note.md")), "On the other drive.\n")
+        self.assertEqual(self.keep("--check", source).returncode, 0)
+
+    @unittest.skipUnless(hasattr(os, "symlink") and os.name == "posix", "needs symlinks")
+    def test_check_does_not_count_a_link_in_the_home_that_points_outside(self):
+        outside = os.path.join(self.scratch, "only-copy.md")
+        write(outside, "Only in scratch.\n")
+        os.makedirs(os.path.join(self.home, "notes"))
+        link = os.path.join(self.home, "notes", "only-copy.md")
+        os.symlink(outside, link)
+        check = self.keep("--check", link)
+        self.assertNotEqual(check.returncode, 0)
+        self.assertIn("no lasting copy", check.stderr)
+        real = os.path.join(self.home, "notes", "real.md")
+        write(real, "Lives in the home.\n")
+        self.assertEqual(self.keep("--check", real).returncode, 0)
+
 
 if __name__ == "__main__":
     unittest.main()
